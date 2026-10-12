@@ -16,19 +16,22 @@ It also works in Edge, Brave, and other Chromium browsers.
 ## Use
 
 1. Log in to LinkedIn and open **My Network → Connections**, or click the LinkOff toolbar icon → **Open my connections**.
-2. Click the blue **LinkOff** button in the bottom-right corner.
-3. Click **1. Scan my connections**. The page scrolls on its own until every connection has loaded.
-4. Click **Keep** next to everyone you know. Your Keep list is saved, so you only do this once. Use the search box to find people quickly.
-5. Click **Select all not kept**. You can uncheck anyone you're unsure about.
-6. Click **Remove selected**.
+2. Click the blue **🧹 LinkOff** button in the bottom-right corner.
+3. Click **Find my connections**. The page scrolls on its own until everyone has loaded.
+4. Each person shows up as a card with a big photo and two big buttons:
+   - **✓ Keep**: you know them. Kept people are never removed, and LinkOff remembers them next time.
+   - **✕ Remove**: removes just this person. Tap it twice (the first tap asks you to confirm), so a slip can't remove anyone.
+5. When you're done, click the red **Remove everyone not kept** button at the bottom.
 
-Click **Stop** at any time to halt. Removed people are crossed out in the list.
+**Can't tell who someone is?** Tap their photo to see it full size with their job title. Or click **👀 Review one by one** to go through people one at a time. Tap Keep or Remove and it moves to the next person on its own.
+
+Click **■ Stop** at any time to halt.
 
 ### Settings
 
-- **Delay between removals** (default 3–7 s, randomized): slows the clicks down so they look human.
-- **Max removals per run** (default 100): run it again later to continue.
-- **Dry run**: opens each person's menu without removing anyone, so you can check it works before doing it for real.
+- **Wait between removals** (default 3–7 s, randomized): slows the clicks down so they look human.
+- **Most people to remove at once** (default 100): run it again later to continue.
+- **Practice mode**: opens each person's menu without removing anyone, so you can check it works before doing it for real.
 
 ## Things to know
 
