@@ -13,7 +13,7 @@
   const SETTINGS_DEFAULTS = { minDelay: 3, maxDelay: 7, maxPerRun: 100 };
 
   const MORE_ACTIONS_RE = /more actions|more options|show more actions/i;
-  const REMOVE_ITEM_RE = /^remove connection$/i;
+  const REMOVE_ITEM_RE = /^remove( this)? connection$/i;
   const CONFIRM_RE = /^remove$/i;
   const LOAD_MORE_RE = /^(show more results|load more)$/i;
 
@@ -68,13 +68,34 @@
     el.click();
   }
 
-  // Finds the first visible clickable element whose own text matches re.
+  // querySelectorAll that also looks inside open shadow roots. LinkedIn renders
+  // some menus and dialogs inside one (e.g. #interop-outlet). Skips our own panel.
+  function deepQueryAll(selector, root = document) {
+    const out = [];
+    const visit = (node) => {
+      out.push(...node.querySelectorAll(selector));
+      for (const el of node.querySelectorAll('*')) {
+        if (el.shadowRoot && el !== host) visit(el.shadowRoot);
+      }
+    };
+    visit(root);
+    return out;
+  }
+
+  // Rendered text only (innerText skips hidden icon titles), whitespace collapsed.
+  function textOf(el) {
+    return (el.innerText ?? el.textContent ?? '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Finds the first visible clickable element whose text or aria-label matches re.
   function findClickableByText(re, root = document) {
-    const candidates = root.querySelectorAll(
-      'button, [role="button"], [role="menuitem"], a, li, div, span'
+    const candidates = deepQueryAll(
+      'button, [role="button"], [role="menuitem"], a, li, div, span, p', root
     );
-    const matches = [...candidates].filter((el) =>
-      re.test((el.textContent || '').replace(/\s+/g, ' ').trim()) && isVisible(el));
+    // Buttons and menu items have short text; skipping long ones keeps this fast on big pages.
+    const matches = candidates.filter((el) =>
+      ((el.textContent || '').length < 120 && re.test(textOf(el)) ||
+        re.test((el.getAttribute('aria-label') || '').trim())) && isVisible(el));
     // Prefer the innermost match so we don't grab a wrapper around the real item.
     const el = matches.find((m) => !matches.some((o) => o !== m && m.contains(o)));
     return el ? el.closest('button, [role="button"], [role="menuitem"], a') || el : null;
@@ -119,7 +140,8 @@
       if (!hit) continue;
       const lines = hit.card.innerText.split('\n').map((s) => s.trim()).filter(Boolean)
         .filter((s) => !/^(message|more actions|show more actions)$/i.test(s));
-      const name = (a.innerText || '').split('\n').map((s) => s.trim()).find(Boolean) || lines[0] || slug;
+      const name = ((a.innerText || '').split('\n').map((s) => s.trim()).find(Boolean) || lines[0] || slug)
+        .replace(/\s+(undefined|null)$/i, '');
       const rest = lines.filter((s) => s !== name);
       const connected = rest.find((s) => /^connected/i.test(s)) || '';
       const headline = rest.find((s) => s !== connected) || '';
@@ -183,8 +205,21 @@
     if (!hit) throw new Error('card not found on page');
 
     realClick(hit.moreBtn);
-    const item = await waitFor(() => findClickableByText(REMOVE_ITEM_RE), 4000)
-      .catch(() => { throw new Error('"Remove connection" menu item not found'); });
+    const item = await waitFor(() => findClickableByText(REMOVE_ITEM_RE), 5000).catch(() => null);
+
+    if (!item) {
+      // The menu didn't show the option we expected. Fall back to the request
+      // LinkedIn's own site sends, and report what the menu showed if that fails too.
+      const seen = visibleMenuTexts();
+      closeMenus();
+      if (dryRun) throw new Error(menuError(seen));
+      try {
+        await removeViaApi(slug);
+        return;
+      } catch (e) {
+        throw new Error(`${menuError(seen)} Backup method also failed (${e.message}).`);
+      }
+    }
 
     if (dryRun) {
       closeMenus();
@@ -194,13 +229,46 @@
 
     realClick(item);
     const dialog = await waitFor(() =>
-      [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].find(isVisible), 4000)
+      deepQueryAll('[role="dialog"], [role="alertdialog"], dialog').find(isVisible), 5000)
       .catch(() => { throw new Error('confirmation dialog did not appear'); });
     const confirm = await waitFor(() =>
-      [...dialog.querySelectorAll('button')].find((b) => isVisible(b) && CONFIRM_RE.test(labelOf(b))), 3000)
+      deepQueryAll('button', dialog).find((b) => isVisible(b) &&
+        (CONFIRM_RE.test(textOf(b)) || CONFIRM_RE.test(labelOf(b)))), 3000)
       .catch(() => { throw new Error('"Remove" confirm button not found'); });
     realClick(confirm);
     await waitFor(() => !isVisible(dialog), 6000).catch(() => {});
+  }
+
+  // Short texts of whatever menu items are on screen, for error messages.
+  function visibleMenuTexts() {
+    const items = deepQueryAll('[role="menuitem"], [role="menu"] li, [role="menu"] button, .artdeco-dropdown__item')
+      .filter(isVisible).map(textOf).filter((t) => t && t.length < 40);
+    return [...new Set(items)].slice(0, 6);
+  }
+
+  function menuError(seen) {
+    return seen.length
+      ? `Menu showed: ${seen.map((t) => `"${t}"`).join(', ')}, but no "Remove connection".`
+      : 'The "…" menu did not open.';
+  }
+
+  // Asks LinkedIn to remove the connection directly, the same request its site makes.
+  async function removeViaApi(slug) {
+    const jsession = /(?:^|;\s*)JSESSIONID="?([^";]+)"?/.exec(document.cookie);
+    if (!jsession) throw new Error('not logged in');
+    const res = await fetch(
+      `/voyager/api/identity/profiles/${encodeURIComponent(slug)}/profileActions?action=disconnect`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'csrf-token': jsession[1],
+          'x-restli-protocol-version': '2.0.0',
+          accept: 'application/vnd.linkedin.normalized+json+2.1',
+        },
+      }
+    );
+    if (!res.ok) throw new Error(`LinkedIn replied ${res.status}`);
   }
 
   function closeMenus() {
