@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkOff – Bulk LinkedIn Disconnect",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Remove LinkedIn connections you don't know with one button, instead of clicking through each one.",
   "permissions": ["storage"],
   "host_permissions": ["https://www.linkedin.com/*"],

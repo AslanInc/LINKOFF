@@ -17,27 +17,30 @@ It also works in Edge, Brave, and other Chromium browsers.
 
 1. Log in to LinkedIn and open **My Network → Connections**, or click the LinkOff toolbar icon → **Open my connections**.
 2. Click the blue **🧹 LinkOff** button in the bottom-right corner.
-3. Click **Find my connections**. The page scrolls on its own until everyone has loaded.
-4. Each person shows up as a card with a big photo and two big buttons:
-   - **✓ Keep**: you know them. Kept people are never removed, and LinkOff remembers them next time.
-   - **✕ Remove**: removes just this person. Tap it twice (the first tap asks you to confirm), so a slip can't remove anyone.
-5. When you're done, click the red **Remove everyone not kept** button at the bottom.
+3. Click **Find my connections**. The page scrolls on its own until everyone has loaded. With a lot of connections this can take a few minutes.
+4. **Tap the people you don't know** to select them. A blue checkmark appears. Or tap **☑ Select all**, then untick anyone you want to keep.
+5. Tap the red **Remove selected** button. Everyone selected is removed, one after another. Tap **■ Stop** at any time.
 
-The tabs at the top sort people into **To review**, **Kept**, and **Removed**. When you keep or remove someone, they leave your To review list, so nobody shows up twice. Changed your mind? Open the **Kept** tab and tap **✓ Kept** to move them back.
+Other buttons on each person:
+- **✓ Keep**: you know them. Kept people can't be selected or removed, and LinkOff remembers them next time.
+- **✕ Remove**: removes just this one person right away.
 
-**Can't tell who someone is?** Tap their photo to see it full size with their job title. Or click **👀 Review one by one** to go through people one at a time. Tap Keep or Remove and it moves to the next person on its own.
+The tabs at the top sort people into **To review**, **Kept**, and **Removed**, so nobody shows up twice. Tap a photo to see it bigger, or tap **👀 One by one** to go through people one at a time.
 
-Click **■ Stop** at any time to halt.
+### If removing doesn't work
+
+LinkOff first tries LinkedIn's "…" → **Remove connection** menu. If that menu won't open, it asks LinkedIn directly instead, the same request LinkedIn's site sends. Whichever way works is used first for everyone after that, which makes it faster.
+
+If both ways fail, tap **📋 Copy problem details** under the error and send it to whoever is helping you. It says exactly what LinkedIn showed.
 
 ### Settings
 
-- **Wait between removals** (default 3–7 s, randomized): slows the clicks down so they look human.
-- **Most people to remove at once** (default 100): run it again later to continue.
-- **Practice mode**: opens each person's menu without removing anyone, so you can check it works before doing it for real.
+- **Wait between removals** (default 1–2 s): set it to 0 for the fastest speed, or higher to look more human.
+- **Practice mode**: tests everything without removing anyone.
 
 ## Things to know
 
 - **Removal is permanent.** To reconnect, you'd have to send a new invite, and LinkedIn doesn't notify people when you remove them.
-- **Go slow with big lists.** Removing hundreds of people quickly can trigger LinkedIn's rate limits. Automating actions is also against LinkedIn's User Agreement, so use it at your own risk. Keep the default delays and do a few batches a day instead of one huge run.
+- **Big batches are risky.** Removing hundreds of people quickly can trigger LinkedIn's limits (LinkOff pauses if LinkedIn says to slow down). Automating actions is also against LinkedIn's User Agreement, so use it at your own risk. Splitting a big list over a few days is safer.
 - **English interface only.** LinkOff finds buttons by their English labels ("Remove connection", "Remove").
 - **If LinkedIn redesigns the page**, removals may fail. LinkOff stops on its own after 3 failures in a row. Please open an issue if that happens.

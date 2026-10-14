@@ -1,6 +1,7 @@
 // LinkOff content script.
-// Runs on linkedin.com, shows a panel on the Connections page, and automates
-// the "More actions -> Remove connection -> Remove" clicks for selected people.
+// Runs on linkedin.com, shows a panel on the Connections page, and removes the
+// people you select: by clicking "More actions -> Remove connection" for you, or,
+// if that menu won't open, by sending LinkedIn the removal request directly.
 //
 // LinkedIn changes its markup often, so elements are found by visible text and
 // aria-labels instead of CSS class names.
@@ -9,8 +10,10 @@
   if (window.__linkoffLoaded) return;
   window.__linkoffLoaded = true;
 
+  const VERSION = '1.2.0';
   const CONNECTIONS_PATH = '/mynetwork/invite-connect/connections';
-  const SETTINGS_DEFAULTS = { minDelay: 3, maxDelay: 7, maxPerRun: 100 };
+  const SETTINGS_KEY = 'settingsV2'; // new key so old, slower saved delays don't carry over
+  const SETTINGS_DEFAULTS = { minDelay: 1, maxDelay: 2 };
 
   const MORE_ACTIONS_RE = /more actions|more options|show more actions/i;
   const REMOVE_ITEM_RE = /^remove( this)? connection$/i;
@@ -55,17 +58,40 @@
     throw new Error('timed out');
   }
 
-  function slugFromHref(href) {
+  function rawSlugFromHref(href) {
     const m = /\/in\/([^/?#]+)/.exec(href || '');
-    return m ? decodeURIComponent(m[1]).toLowerCase() : null;
+    return m ? decodeURIComponent(m[1]) : null;
   }
 
+  function slugFromHref(href) {
+    return rawSlugFromHref(href)?.toLowerCase() ?? null;
+  }
+
+  function fire(el, type, Ctor, extra) {
+    el.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, composed: true, view: window, ...extra }));
+  }
+
+  // Replays the full event sequence a real mouse click makes, at the element's center.
   function realClick(el) {
     el.scrollIntoView({ block: 'center' });
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
-      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-    }
-    el.click();
+    const r = el.getBoundingClientRect();
+    const pos = { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
+    const ptr = { ...pos, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    fire(el, 'pointerover', PointerEvent, ptr);
+    fire(el, 'mouseover', MouseEvent, pos);
+    fire(el, 'pointerdown', PointerEvent, { ...ptr, buttons: 1 });
+    fire(el, 'mousedown', MouseEvent, { ...pos, buttons: 1 });
+    el.focus?.({ preventScroll: true });
+    fire(el, 'pointerup', PointerEvent, ptr);
+    fire(el, 'mouseup', MouseEvent, pos);
+    fire(el, 'click', MouseEvent, { ...pos, detail: 1 });
+  }
+
+  function pressKey(el, key) {
+    el.focus?.({ preventScroll: true });
+    const init = { key, code: key === ' ' ? 'Space' : key, keyCode: key === ' ' ? 32 : 13, which: key === ' ' ? 32 : 13 };
+    fire(el, 'keydown', KeyboardEvent, init);
+    fire(el, 'keyup', KeyboardEvent, init);
   }
 
   // querySelectorAll that also looks inside open shadow roots. LinkedIn renders
@@ -101,6 +127,29 @@
     return el ? el.closest('button, [role="button"], [role="menuitem"], a') || el : null;
   }
 
+  // Short description of an element, for the "Copy problem details" report.
+  function describe(el, withHtml = false) {
+    if (!el) return '(none)';
+    if (withHtml) return el.outerHTML.replace(/\s+/g, ' ').slice(0, 500);
+    const attrs = ['role', 'aria-label', 'data-testid'].map((a) => el.getAttribute(a) && `${a}="${el.getAttribute(a)}"`)
+      .filter(Boolean).join(' ');
+    return `<${el.tagName.toLowerCase()}${attrs ? ' ' + attrs : ''}> "${textOf(el).slice(0, 60)}"`;
+  }
+
+  // Records elements LinkedIn adds to the page while we try to open a menu.
+  function watchAdded() {
+    const seen = [];
+    const obs = new MutationObserver((records) => {
+      for (const r of records) {
+        for (const n of r.addedNodes) {
+          if (n.nodeType === 1 && n !== host && seen.length < 15) seen.push(describe(n));
+        }
+      }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+    return { stop: () => { obs.disconnect(); return [...new Set(seen)]; } };
+  }
+
   // ---------- reading connections from the page ----------
 
   function profileAnchors() {
@@ -118,17 +167,25 @@
   function cardFor(anchor, slug) {
     let el = anchor.parentElement;
     while (el && el !== document.body) {
-      const btn = [...el.querySelectorAll('button, [role="button"]')].find(isMoreActionsButton);
-      if (btn) {
+      const btns = [...el.querySelectorAll('button, [role="button"]')].filter(isMoreActionsButton);
+      if (btns.length) {
         const slugs = new Set(
           [...el.querySelectorAll('a[href*="/in/"]')].map((a) => slugFromHref(a.href))
         );
-        if (slugs.size === 1 && slugs.has(slug)) return { card: el, moreBtn: btn };
+        if (slugs.size === 1 && slugs.has(slug)) return { card: el, moreBtn: btns.find(isVisible) || btns[0] };
         return null;
       }
       el = el.parentElement;
     }
     return null;
+  }
+
+  // LinkedIn's internal member ID ("ACoAA…"), if the card carries it somewhere.
+  function memberIdFrom(card, rawSlug) {
+    if (/^ACo[A-Za-z0-9_-]{10,}$/.test(rawSlug)) return rawSlug;
+    const m = /urn:li:fsd_profile:(ACo[A-Za-z0-9_-]+)/.exec(card.outerHTML) ||
+      /\b(ACoA[A-Za-z0-9_-]{20,})\b/.exec(card.outerHTML);
+    return m ? m[1] : '';
   }
 
   function scanVisibleConnections() {
@@ -138,6 +195,7 @@
       if (!slug || found.has(slug)) continue;
       const hit = cardFor(a, slug);
       if (!hit) continue;
+      const rawSlug = rawSlugFromHref(a.href);
       const lines = hit.card.innerText.split('\n').map((s) => s.trim()).filter(Boolean)
         .filter((s) => !/^(message|more actions|show more actions)$/i.test(s));
       const name = ((a.innerText || '').split('\n').map((s) => s.trim()).find(Boolean) || lines[0] || slug)
@@ -145,7 +203,12 @@
       const rest = lines.filter((s) => s !== name);
       const connected = rest.find((s) => /^connected/i.test(s)) || '';
       const headline = rest.find((s) => s !== connected) || '';
-      found.set(slug, { slug, name, headline, connected, photo: photoFrom(hit.card), url: `https://www.linkedin.com/in/${slug}/` });
+      found.set(slug, {
+        slug, rawSlug, name, headline, connected,
+        photo: photoFrom(hit.card),
+        memberId: memberIdFrom(hit.card, rawSlug),
+        url: `https://www.linkedin.com/in/${rawSlug}/`,
+      });
     }
     return found;
   }
@@ -168,7 +231,6 @@
     return null;
   }
 
-  // Scrolls / clicks "Show more results" until the list stops growing.
   // LinkedIn sometimes links one person under two addresses (a vanity name and an
   // ID), so also treat the same name + headline (or name + photo) as the same person.
   function personKey(c) {
@@ -207,7 +269,8 @@
       const before = all.size;
       for (const [k, v] of scanVisibleConnections()) {
         if (all.has(k)) {
-          all.set(k, { ...v, photo: v.photo || all.get(k).photo || '' });
+          const old = all.get(k);
+          all.set(k, { ...v, photo: v.photo || old.photo, memberId: v.memberId || old.memberId });
           continue;
         }
         const key = personKey(v);
@@ -230,51 +293,88 @@
 
   // ---------- removing one connection ----------
 
-  async function removeConnection(slug, { dryRun }) {
-    let hit = findCard(slug);
-    if (!hit) {
-      // The list can be virtualized; scroll through it to bring the card back.
-      for (let y = 0; y < document.body.scrollHeight && !hit; y += window.innerHeight * 0.8) {
-        window.scrollTo(0, y);
-        await sleep(300);
-        hit = findCard(slug);
+  // Which way worked last time ('ui' = clicking the menu, 'api' = direct request).
+  // Trying that one first makes long runs much faster.
+  let preferredMethod = 'ui';
+
+  async function removeConnection(c, { dryRun, debug }) {
+    const order = preferredMethod === 'api' ? ['api', 'ui'] : ['ui', 'api'];
+    const errors = [];
+    for (const method of order) {
+      try {
+        const note = method === 'ui'
+          ? await removeViaUi(c, dryRun, debug)
+          : await removeViaApi(c, dryRun, debug);
+        preferredMethod = method;
+        return note;
+      } catch (e) {
+        debug.push(`${method} failed: ${e.message}`);
+        errors.push(`${method === 'ui' ? 'Menu' : 'Backup'}: ${e.message}`);
       }
     }
-    if (!hit) throw new Error('card not found on page');
+    throw new Error(errors.join(' · '));
+  }
 
-    realClick(hit.moreBtn);
-    const item = await waitFor(() => findClickableByText(REMOVE_ITEM_RE), 5000).catch(() => null);
+  async function scrollToFind(slug) {
+    const box = scrollContainers(profileAnchors()[0])[0] || document.scrollingElement;
+    for (let y = 0; y < box.scrollHeight; y += box.clientHeight * 0.8) {
+      box.scrollTop = y;
+      await sleep(250);
+      const hit = findCard(slug);
+      if (hit) return hit;
+    }
+    return null;
+  }
 
+  async function removeViaUi(c, dryRun, debug) {
+    const hit = findCard(c.slug) || await scrollToFind(c.slug);
+    if (!hit) throw new Error('person not found on the page');
+    debug.push('More button: ' + describe(hit.moreBtn, true));
+
+    const watcher = watchAdded();
+    const tries = [
+      ['mouse click', () => realClick(hit.moreBtn)],
+      ['Enter key', () => pressKey(hit.moreBtn, 'Enter')],
+      ['plain click', () => hit.moreBtn.click()],
+    ];
+    let item = null;
+    for (const [label, run] of tries) {
+      run();
+      item = await waitFor(() => findClickableByText(REMOVE_ITEM_RE), 2000).catch(() => null);
+      debug.push(`${label}: ${item ? 'found Remove connection' : 'no Remove option'}` +
+        ` (aria-expanded=${hit.moreBtn.getAttribute('aria-expanded')})`);
+      if (item) break;
+    }
+    const added = watcher.stop();
     if (!item) {
-      // The menu didn't show the option we expected. Fall back to the request
-      // LinkedIn's own site sends, and report what the menu showed if that fails too.
       const seen = visibleMenuTexts();
+      debug.push('Menu items on screen: ' + (seen.join(' | ') || 'none'));
+      debug.push('Added to page after clicking: ' + (added.join(' | ') || 'nothing'));
       closeMenus();
-      if (dryRun) throw new Error(menuError(seen));
-      try {
-        await removeViaApi(slug);
-        return;
-      } catch (e) {
-        throw new Error(`${menuError(seen)} Backup method also failed (${e.message}).`);
-      }
+      throw new Error(menuError(seen));
     }
 
     if (dryRun) {
       closeMenus();
       await sleep(300);
-      return;
+      return 'Practice run worked ✓';
     }
 
     realClick(item);
+    // Usually LinkedIn asks "Remove connection?"; sometimes it removes straight away.
     const dialog = await waitFor(() =>
-      deepQueryAll('[role="dialog"], [role="alertdialog"], dialog').find(isVisible), 5000)
-      .catch(() => { throw new Error('confirmation dialog did not appear'); });
+      deepQueryAll('[role="dialog"], [role="alertdialog"], dialog').find(isVisible), 3000).catch(() => null);
+    if (!dialog) {
+      if (!findCard(c.slug)) return '';
+      throw new Error('confirmation box did not appear');
+    }
     const confirm = await waitFor(() =>
       deepQueryAll('button', dialog).find((b) => isVisible(b) &&
         (CONFIRM_RE.test(textOf(b)) || CONFIRM_RE.test(labelOf(b)))), 3000)
-      .catch(() => { throw new Error('"Remove" confirm button not found'); });
+      .catch(() => { throw new Error('"Remove" button in the confirmation box not found'); });
     realClick(confirm);
     await waitFor(() => !isVisible(dialog), 6000).catch(() => {});
+    return '';
   }
 
   // Short texts of whatever menu items are on screen, for error messages.
@@ -286,27 +386,8 @@
 
   function menuError(seen) {
     return seen.length
-      ? `Menu showed: ${seen.map((t) => `"${t}"`).join(', ')}, but no "Remove connection".`
-      : 'The "…" menu did not open.';
-  }
-
-  // Asks LinkedIn to remove the connection directly, the same request its site makes.
-  async function removeViaApi(slug) {
-    const jsession = /(?:^|;\s*)JSESSIONID="?([^";]+)"?/.exec(document.cookie);
-    if (!jsession) throw new Error('not logged in');
-    const res = await fetch(
-      `/voyager/api/identity/profiles/${encodeURIComponent(slug)}/profileActions?action=disconnect`,
-      {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'csrf-token': jsession[1],
-          'x-restli-protocol-version': '2.0.0',
-          accept: 'application/vnd.linkedin.normalized+json+2.1',
-        },
-      }
-    );
-    if (!res.ok) throw new Error(`LinkedIn replied ${res.status}`);
+      ? `menu showed ${seen.map((t) => `"${t}"`).join(', ')} but no "Remove connection"`
+      : 'the "…" menu did not open';
   }
 
   function closeMenus() {
@@ -314,11 +395,64 @@
     document.body.click();
   }
 
+  // ----- direct requests to LinkedIn (the same ones its own site makes) -----
+
+  function csrfToken() {
+    return /(?:^|;\s*)JSESSIONID="?([^";]+)"?/.exec(document.cookie)?.[1];
+  }
+
+  function voyager(path, { method = 'GET', body } = {}) {
+    const token = csrfToken();
+    if (!token) throw new Error('not logged in');
+    return fetch(path, {
+      method,
+      credentials: 'include',
+      headers: {
+        'csrf-token': token,
+        'x-restli-protocol-version': '2.0.0',
+        accept: 'application/vnd.linkedin.normalized+json+2.1',
+        ...(body ? { 'content-type': 'application/json; charset=UTF-8' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  }
+
+  async function lookupMemberId(c, debug) {
+    if (c.memberId) return c.memberId;
+    const res = await voyager(
+      `/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity=${encodeURIComponent(c.rawSlug)}`);
+    debug.push(`profile lookup -> ${res.status}`);
+    if (!res.ok) throw new Error(`profile lookup failed (${res.status})`);
+    const id = /urn:li:fsd_profile:(ACo[A-Za-z0-9_-]+)/.exec(await res.text())?.[1];
+    if (!id) throw new Error('profile ID not found');
+    return (c.memberId = id);
+  }
+
+  async function removeViaApi(c, dryRun, debug) {
+    const id = await lookupMemberId(c, debug);
+    if (dryRun) return 'Practice: the menu way failed, but the backup way found this person ✓';
+    const urn = `urn:li:fsd_connection:${id}`;
+    const attempts = [
+      ['POST', '/voyager/api/relationships/dash/memberRelationships?action=removeFromMyConnections', { connectionUrn: urn }],
+      ['DELETE', `/voyager/api/relationships/dash/connections/${encodeURIComponent(urn)}`],
+    ];
+    const statuses = [];
+    for (const [method, path, body] of attempts) {
+      const res = await voyager(path, { method, body });
+      debug.push(`${method} ${path.split('?')[0]} -> ${res.status}`);
+      statuses.push(res.status);
+      if (res.ok) return '';
+      if (res.status === 429) throw new Error('LinkedIn says slow down (429). Wait a while, then try again');
+    }
+    throw new Error(`LinkedIn refused (${statuses.join(', ')})`);
+  }
+
   // ---------- panel UI ----------
 
   const state = {
-    connections: [], // [{slug, name, headline, connected, url, photo, status, error}]
+    connections: [], // [{slug, rawSlug, name, headline, connected, url, photo, memberId, status, error}]
     keep: {}, // slug -> name
+    selected: new Set(), // slugs ticked for removal
     settings: { ...SETTINGS_DEFAULTS },
     filter: '',
     tab: 'todo', // which list is showing: todo | kept | removed
@@ -326,6 +460,7 @@
     busy: false,
     stop: false,
     viewing: null, // slug shown in the big photo view
+    report: '', // details of the last failure, for "Copy problem details"
   };
 
   let host, shadow, ui;
@@ -363,18 +498,23 @@
     .tabs button b { display:inline-block;min-width:22px;margin-left:2px;padding:1px 6px;border-radius:10px;background:#dfe6ee;font-size:12px; }
     .tabs button.on { background:#fff;color:#0a66c2;box-shadow:0 1px 3px rgba(0,0,0,.15); }
     .tabs button.on b { background:#0a66c2;color:#fff; }
-    .review { border:2px solid #0a66c2;background:#fff;color:#0a66c2;border-radius:22px;padding:10px 14px;font-weight:700;font-size:15px; }
+    .row { display:flex;gap:8px; }
+    .row button { flex:1;border:2px solid #0a66c2;background:#fff;color:#0a66c2;border-radius:22px;padding:10px 8px;font-weight:700;font-size:15px; }
+    .row button.sel-all { background:#0a66c2;color:#fff; }
     .empty { text-align:center;color:#666;padding:30px 10px;font-size:16px; }
 
     .list { flex:1;overflow:auto;padding:12px 16px;display:flex;flex-direction:column;gap:12px;background:#f4f2ee; }
-    .card { background:#fff;border:2px solid #e0dfdc;border-radius:14px;padding:14px;display:grid;grid-template-columns:96px 1fr;gap:12px 14px;align-items:center; }
-    .card.kept { border-color:#057642;background:#f3faf5; }
-    .card.done { opacity:.5; }
+    .card { position:relative;background:#fff;border:2px solid #e0dfdc;border-radius:14px;padding:14px;display:grid;grid-template-columns:96px 1fr;gap:12px 14px;align-items:center;cursor:pointer; }
+    .card.kept { border-color:#057642;background:#f3faf5;cursor:default; }
+    .card.picked { border:3px solid #0a66c2;background:#eaf3fc;padding:13px; }
+    .card.done { opacity:.5;cursor:default; }
     .card.fail { border-color:#cc1016; }
+    .pick { position:absolute;top:10px;right:10px;width:34px;height:34px;border-radius:50%;border:2px solid #9aa5b1;background:#fff;color:transparent;font-size:20px;font-weight:900;line-height:28px;padding:0; }
+    .picked .pick { background:#0a66c2;border-color:#0a66c2;color:#fff; }
     .photo-btn { padding:0;border:0;background:none;border-radius:50%;width:96px;height:96px;position:relative; }
     .photo-btn::after { content:"🔍";position:absolute;right:0;bottom:0;background:#fff;border-radius:50%;width:28px;height:28px;font-size:14px;line-height:28px;box-shadow:0 1px 4px rgba(0,0,0,.3); }
     .photo, .initials { width:100%;height:100%;border-radius:50%;object-fit:cover;display:flex;align-items:center;justify-content:center;background:#c9d7e6;color:#0a3a6b;font-weight:800;font-size:32px; }
-    .info { min-width:0; }
+    .info { min-width:0;padding-right:36px; }
     .name { color:#1d2226;font-size:18px;font-weight:700;text-decoration:none;display:block; }
     .name:hover { text-decoration:underline; }
     .headline { color:#555;font-size:14px;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden; }
@@ -385,11 +525,12 @@
     .keep { border:2px solid #057642;background:#fff;color:#057642; }
     .kept .keep, .keep.on { background:#057642;color:#fff; }
     .remove { border:2px solid #cc1016;background:#cc1016;color:#fff; }
-    .remove[data-armed] { background:#7a0a0d;border-color:#7a0a0d; }
     .done-label { grid-column:1 / -1;text-align:center;font-weight:700;color:#555;padding:10px; }
-    .busy .actions button, .busy .viewer-actions button { pointer-events:none;opacity:.5; }
+    .busy .actions button, .busy .viewer-actions button, .busy .pick, .busy .row button { pointer-events:none;opacity:.5; }
 
-    .status { padding:12px 16px;background:#fff8e6;border-top:1px solid #f0e2b6;font-size:15px; }
+    .status { padding:12px 16px;background:#fff8e6;border-top:1px solid #f0e2b6;font-size:15px;display:flex;flex-direction:column;gap:8px; }
+    .status .copy { align-self:flex-start;border:1px solid #b58900;background:#fff;color:#7a5c00;border-radius:16px;padding:6px 12px;font-weight:600;font-size:13px; }
+    .status textarea { width:100%;height:90px;font:12px monospace; }
     footer { padding:12px 16px 16px;border-top:1px solid #e8e8e8;display:flex;flex-direction:column;gap:10px; }
     details summary { cursor:pointer;color:#555;font-size:14px; }
     .settings label { display:flex;justify-content:space-between;align-items:center;margin:10px 0;font-size:14px; }
@@ -427,8 +568,8 @@
           <h2>Clean up your connections</h2>
           <ol class="steps">
             <li><span class="n">1</span>Find your connections</li>
-            <li><span class="n">2</span>Tap <b>&nbsp;Keep&nbsp;</b> on people you know</li>
-            <li><span class="n">3</span>Remove everyone else with one button</li>
+            <li><span class="n">2</span>Tap the people you don't know</li>
+            <li><span class="n">3</span>Remove them all with one button</li>
           </ol>
           <button class="big primary scan">Find my connections</button>
         </div>
@@ -440,20 +581,26 @@
             <button data-tab="kept">Kept <b></b></button>
             <button data-tab="removed">Removed <b></b></button>
           </div>
-          <button class="review">👀 Review one by one</button>
+          <div class="row select-row">
+            <button class="sel-all">☑ Select all</button>
+            <button class="sel-none">Clear</button>
+            <button class="review">👀 One by one</button>
+          </div>
         </div>
         <div class="list" hidden></div>
 
-        <div class="status" hidden></div>
+        <div class="status" hidden>
+          <span class="msg"></span>
+          <button class="copy" hidden>📋 Copy problem details</button>
+        </div>
 
         <footer hidden>
-          <button class="big danger remove-all">Remove everyone not kept</button>
+          <button class="big danger remove-sel">Remove selected</button>
           <button class="big grey stop" hidden>■ Stop</button>
           <details class="settings">
             <summary>Settings</summary>
-            <label>Wait at least (seconds) between removals <input type="number" class="minDelay" min="1"></label>
-            <label>Wait at most (seconds) between removals <input type="number" class="maxDelay" min="1"></label>
-            <label>Most people to remove at once <input type="number" class="maxPerRun" min="1"></label>
+            <label>Wait at least (seconds) between removals <input type="number" class="minDelay" min="0" step="0.5"></label>
+            <label>Wait at most (seconds) between removals <input type="number" class="maxDelay" min="0" step="0.5"></label>
             <label>Practice mode (don't actually remove) <input type="checkbox" class="dryRun"></label>
             <button class="rescan">↻ Find connections again</button>
           </details>
@@ -482,10 +629,10 @@
     ui = {
       fab: $('.fab'), panel: $('.panel'), close: $('.close'), start: $('.start'), scan: $('.scan'),
       toolbar: $('.toolbar'), search: $('input[type=search]'), tabs: [...shadow.querySelectorAll('.tabs button')],
-      review: $('.review'),
-      list: $('.list'), status: $('.status'), footer: $('footer'), removeAll: $('.remove-all'),
-      stop: $('.stop'), rescan: $('.rescan'), dryRun: $('.dryRun'),
-      minDelay: $('.minDelay'), maxDelay: $('.maxDelay'), maxPerRun: $('.maxPerRun'),
+      selectRow: $('.select-row'), selAll: $('.sel-all'), selNone: $('.sel-none'), review: $('.review'),
+      list: $('.list'), status: $('.status'), msg: $('.status .msg'), copy: $('.status .copy'),
+      footer: $('footer'), removeSel: $('.remove-sel'), stop: $('.stop'), rescan: $('.rescan'), dryRun: $('.dryRun'),
+      minDelay: $('.minDelay'), maxDelay: $('.maxDelay'),
       viewer: $('.viewer'), back: $('.back'), bigPhoto: $('.big-photo'), vName: $('.v-name'),
       vHeadline: $('.v-headline'), vMeta: $('.v-meta'), vKeep: $('.v-keep'), vRemove: $('.v-remove'),
       prev: $('.prev'), next: $('.next'), pos: $('.pos'),
@@ -497,8 +644,14 @@
     ui.rescan.onclick = onScan;
     ui.stop.onclick = requestStop;
     ui.search.oninput = () => { state.filter = ui.search.value.toLowerCase(); renderList(); };
-    ui.removeAll.onclick = onRemoveAll;
+    ui.removeSel.onclick = onRemoveSelected;
+    ui.copy.onclick = copyReport;
     for (const t of ui.tabs) t.onclick = () => { state.tab = t.dataset.tab; renderList(); };
+    ui.selAll.onclick = () => {
+      for (const c of filtered()) if (!decided(c)) state.selected.add(c.slug);
+      renderList();
+    };
+    ui.selNone.onclick = () => { state.selected.clear(); renderList(); };
     ui.review.onclick = () => {
       const rows = filtered();
       const first = rows.find((c) => !decided(c)) || rows[0];
@@ -515,20 +668,20 @@
       toggleKeep(c);
       if (!wasKept) stepViewer(1, true); // move on to the next person
     };
-    ui.vRemove.onclick = () => armRemove(ui.vRemove, byslug(state.viewing), true);
+    ui.vRemove.onclick = () => removeOne(byslug(state.viewing), true);
 
-    for (const key of ['minDelay', 'maxDelay', 'maxPerRun']) {
+    for (const key of ['minDelay', 'maxDelay']) {
       ui[key].value = state.settings[key];
       ui[key].onchange = () => {
-        state.settings[key] = Math.max(1, Number(ui[key].value) || SETTINGS_DEFAULTS[key]);
+        const v = Number(ui[key].value);
+        state.settings[key] = Number.isFinite(v) && v >= 0 ? v : SETTINGS_DEFAULTS[key];
         ui[key].value = state.settings[key];
-        storage.set('settings', state.settings);
+        storage.set(SETTINGS_KEY, state.settings);
       };
     }
   }
 
   const byslug = (slug) => state.connections.find((c) => c.slug === slug);
-
   const decided = (c) => !!state.keep[c.slug] || c.status === 'done';
 
   function inTab(c, tab = state.tab) {
@@ -542,18 +695,42 @@
       (!state.filter || (c.name + ' ' + c.headline).toLowerCase().includes(state.filter)));
   }
 
-  function removable() {
-    return state.connections.filter((c) => !state.keep[c.slug] && c.status !== 'done');
-  }
-
-  function setStatus(msg) {
-    ui.status.textContent = msg;
+  function setStatus(msg, { problem = false } = {}) {
+    ui.msg.textContent = msg;
     ui.status.hidden = !msg;
+    ui.copy.hidden = !(problem && state.report);
+    ui.status.querySelector('textarea')?.remove();
   }
 
   function requestStop() {
     state.stop = true;
     setStatus('Stopping…');
+  }
+
+  async function copyReport() {
+    try {
+      await navigator.clipboard.writeText(state.report);
+      ui.copy.textContent = '✓ Copied! Paste it to whoever is helping you';
+    } catch {
+      // Clipboard blocked: show the text so it can be copied by hand.
+      if (!ui.status.querySelector('textarea')) {
+        const ta = document.createElement('textarea');
+        ta.value = state.report;
+        ui.status.append(ta);
+        ta.select();
+      }
+    }
+  }
+
+  function buildReport(c, debug, error) {
+    return [
+      `LinkOff ${VERSION} problem report`,
+      `Page: ${location.pathname}`,
+      `Browser: ${navigator.userAgent}`,
+      `Person: ${c.name} (${c.rawSlug}) memberId=${c.memberId || '?'}`,
+      `Error: ${error}`,
+      ...debug,
+    ].join('\n');
   }
 
   function photoEl(c) {
@@ -573,28 +750,21 @@
     return img;
   }
 
-  // A Remove button needs two taps, so a slip of the finger can't remove someone.
-  function armRemove(btn, c, fromViewer = false) {
-    if (state.busy || !c) return;
-    if (btn.dataset.armed) {
-      clearTimeout(btn._disarm);
-      delete btn.dataset.armed;
-      removeOne(c, fromViewer);
-      return;
-    }
-    btn.dataset.armed = '1';
-    btn.textContent = 'Tap again to confirm';
-    btn._disarm = setTimeout(() => {
-      delete btn.dataset.armed;
-      btn.textContent = '✕ Remove';
-    }, 3000);
+  function toggleSelect(c) {
+    if (state.busy || decided(c)) return;
+    if (state.selected.has(c.slug)) state.selected.delete(c.slug);
+    else state.selected.add(c.slug);
+    refresh(c);
   }
 
   function cardEl(c) {
     const kept = !!state.keep[c.slug];
+    const picked = state.selected.has(c.slug);
     const card = document.createElement('div');
-    card.className = 'card' + (kept ? ' kept' : '') + (c.status ? ' ' + c.status : '');
+    card.className = 'card' + (kept ? ' kept' : '') + (picked ? ' picked' : '') + (c.status ? ' ' + c.status : '');
     card.dataset.slug = c.slug;
+    // Tapping anywhere on the card (except its buttons and links) selects it.
+    card.onclick = (e) => { if (!e.target.closest('button, a')) toggleSelect(c); };
 
     const photoBtn = document.createElement('button');
     photoBtn.className = 'photo-btn';
@@ -629,6 +799,15 @@
       return card;
     }
 
+    if (!kept) {
+      const pick = document.createElement('button');
+      pick.className = 'pick';
+      pick.title = 'Select to remove';
+      pick.textContent = '✓';
+      pick.onclick = () => toggleSelect(c);
+      card.append(pick);
+    }
+
     const actions = document.createElement('div');
     actions.className = 'actions';
     const keep = document.createElement('button');
@@ -639,7 +818,7 @@
     const remove = document.createElement('button');
     remove.className = 'remove';
     remove.textContent = '✕ Remove';
-    remove.onclick = () => armRemove(remove, c);
+    remove.onclick = () => removeOne(c);
     actions.append(keep, remove);
     card.append(actions);
     return card;
@@ -662,10 +841,10 @@
       ui.list.append(empty);
     }
     for (const t of ui.tabs) t.classList.toggle('on', t.dataset.tab === state.tab);
+    ui.selAll.hidden = ui.selNone.hidden = state.tab !== 'todo';
     updateCounts();
   }
 
-  // Re-draws one person's card (and the big view, if open) without rebuilding the whole list.
   // A person who no longer belongs in the open tab (e.g. just kept) leaves the list.
   function refresh(c) {
     const old = ui.list.querySelector(`.card[data-slug="${CSS.escape(c.slug)}"]`);
@@ -679,17 +858,17 @@
   }
 
   function updateCounts() {
-    const n = removable().length;
     for (const t of ui.tabs) {
       t.querySelector('b').textContent = state.connections.filter((c) => inTab(c, t.dataset.tab)).length;
     }
-    ui.removeAll.textContent = n ? `Remove everyone not kept (${n})` : 'Nobody left to remove';
-    ui.removeAll.disabled = n === 0 || state.busy;
+    const n = state.selected.size;
+    ui.removeSel.textContent = n ? `Remove ${n} selected` : 'Tap people to select them';
+    ui.removeSel.disabled = n === 0 || state.busy;
   }
 
   function toggleKeep(c) {
     if (state.keep[c.slug]) delete state.keep[c.slug];
-    else state.keep[c.slug] = c.name;
+    else { state.keep[c.slug] = c.name; state.selected.delete(c.slug); }
     storage.set('keep', state.keep);
     refresh(c);
   }
@@ -715,7 +894,7 @@
     let j = q.indexOf(state.viewing) + dir;
     while (q[j] && (!byslug(q[j]) || (undecidedOnly && decided(byslug(q[j]))))) j += dir;
     if (q[j]) openViewer(q[j]);
-    else if (dir > 0) { closeViewer(); setStatus("That's everyone! Use the red button to remove everyone you didn't keep."); }
+    else if (dir > 0) { closeViewer(); setStatus("That's everyone!"); }
   }
 
   function renderViewer() {
@@ -736,9 +915,6 @@
     ui.vKeep.hidden = ui.vRemove.hidden = done;
     ui.vKeep.textContent = kept ? '✓ Kept' : '✓ Keep';
     ui.vKeep.classList.toggle('on', kept);
-    clearTimeout(ui.vRemove._disarm);
-    delete ui.vRemove.dataset.armed;
-    ui.vRemove.textContent = '✕ Remove';
     if (done) ui.vMeta.textContent = 'Removed';
 
     ui.pos.textContent = i >= 0 ? `${i + 1} of ${state.queue.length}` : '';
@@ -752,7 +928,7 @@
     state.stop = false;
     ui.panel.classList.toggle('busy', busy);
     ui.rescan.disabled = busy;
-    ui.removeAll.hidden = busy;
+    ui.removeSel.hidden = busy;
     ui.stop.hidden = !busy;
     updateCounts();
   }
@@ -768,8 +944,9 @@
         () => state.stop
       );
       state.connections = [...all.values()];
+      state.selected = new Set([...state.selected].filter((s) => all.has(s)));
       setStatus(all.size
-        ? `Found ${all.size} connections. Tap ✓ Keep on people you know.`
+        ? `Found ${all.size} connections. Tap the people you don't know, then press Remove.`
         : "Couldn't find any connections. Make sure you're logged in and on your Connections page.");
     } catch (e) {
       setStatus('Something went wrong: ' + e.message);
@@ -779,45 +956,46 @@
     renderList();
   }
 
-  async function removeOneQuietly(c, dryRun) {
+  // Removes one person and updates their card. Returns true on success.
+  async function removeAndMark(c, dryRun) {
+    const debug = [];
     try {
-      await removeConnection(c.slug, { dryRun });
+      const note = await removeConnection(c, { dryRun, debug });
       c.status = dryRun ? '' : 'done';
-      c.error = dryRun ? 'Practice run worked ✓' : '';
-      if (!dryRun) await logRemoval(c);
+      c.error = note;
+      if (!dryRun) {
+        state.selected.delete(c.slug);
+        await logRemoval(c);
+      }
       return true;
     } catch (e) {
       closeMenus();
       c.status = 'fail';
       c.error = "Couldn't remove: " + e.message;
+      state.report = buildReport(c, debug, e.message);
       return false;
     } finally {
       refresh(c);
     }
   }
 
-  async function removeOne(c, fromViewer) {
+  async function removeOne(c, fromViewer = false) {
+    if (state.busy || !c) return;
     const dryRun = ui.dryRun.checked;
     setBusy(true);
     setStatus(`${dryRun ? 'Practicing on' : 'Removing'} ${c.name}…`);
-    const ok = await removeOneQuietly(c, dryRun);
+    const ok = await removeAndMark(c, dryRun);
     setBusy(false);
-    setStatus(ok ? `${dryRun ? 'Practice run worked for' : 'Removed'} ${c.name}.` : `Couldn't remove ${c.name}.`);
+    setStatus(ok ? `${dryRun ? 'Practice run worked for' : 'Removed'} ${c.name}.` : `Couldn't remove ${c.name}.`,
+      { problem: !ok });
     if (ok && fromViewer && state.viewing === c.slug) stepViewer(1, true);
   }
 
-  async function onRemoveAll() {
-    const queue = removable();
-    const { minDelay, maxDelay, maxPerRun } = state.settings;
-    const dryRun = ui.dryRun.checked;
-    const batch = queue.slice(0, maxPerRun);
+  async function onRemoveSelected() {
+    const batch = state.connections.filter((c) => state.selected.has(c.slug) && !decided(c));
     if (!batch.length) return;
-
-    const msg = dryRun
-      ? `Practice run on ${batch.length} people. Nobody will actually be removed. Continue?`
-      : `Remove ${batch.length} people you didn't keep?\n\nThis can't be undone.` +
-        (queue.length > batch.length ? `\n\n(Removing ${maxPerRun} now. Run it again for the rest. You can change this in Settings.)` : '');
-    if (!confirm(msg)) return;
+    const { minDelay, maxDelay } = state.settings;
+    const dryRun = ui.dryRun.checked;
 
     closeViewer();
     setBusy(true);
@@ -826,7 +1004,7 @@
       if (state.stop) break;
       const c = batch[i];
       setStatus(`${dryRun ? 'Practicing' : 'Removing'} ${i + 1} of ${batch.length}: ${c.name}`);
-      if (await removeOneQuietly(c, dryRun)) { ok++; consecutiveFails = 0; }
+      if (await removeAndMark(c, dryRun)) { ok++; consecutiveFails = 0; }
       else { failed++; consecutiveFails++; }
       if (consecutiveFails >= 3) break;
       if (i < batch.length - 1 && !state.stop) await randDelay(minDelay, Math.max(minDelay, maxDelay));
@@ -834,10 +1012,12 @@
     const stopped = state.stop;
     setBusy(false);
     if (consecutiveFails >= 3) {
-      setStatus('Paused after 3 problems in a row. LinkedIn may have changed its page or be slowing you down. Try again later.');
+      setStatus('Paused after 3 problems in a row. LinkedIn may have changed its page or be slowing you down.',
+        { problem: true });
     } else {
       setStatus(`${dryRun ? 'Practice finished' : 'All done'}: ${ok} ${dryRun ? 'worked' : 'removed'}` +
-        (failed ? `, ${failed} couldn't be removed` : '') + '.' + (stopped ? ' (You stopped early.)' : ''));
+        (failed ? `, ${failed} couldn't be removed` : '') + '.' + (stopped ? ' (You stopped early.)' : ''),
+        { problem: failed > 0 });
     }
   }
 
@@ -851,7 +1031,7 @@
 
   async function init() {
     state.keep = await storage.get('keep', {});
-    state.settings = { ...SETTINGS_DEFAULTS, ...(await storage.get('settings', {})) };
+    state.settings = { ...SETTINGS_DEFAULTS, ...(await storage.get(SETTINGS_KEY, {})) };
     buildPanel();
     const sync = () => {
       host.style.display = location.pathname.startsWith(CONNECTIONS_PATH) ? '' : 'none';
