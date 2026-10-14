@@ -15,7 +15,7 @@
   const MORE_ACTIONS_RE = /more actions|more options|show more actions/i;
   const REMOVE_ITEM_RE = /^remove( this)? connection$/i;
   const CONFIRM_RE = /^remove$/i;
-  const LOAD_MORE_RE = /^(show more results|load more)$/i;
+  const LOAD_MORE_RE = /^(show more results|show more|load more|see more)$/i;
 
   // ---------- small helpers ----------
 
@@ -169,20 +169,58 @@
   }
 
   // Scrolls / clicks "Show more results" until the list stops growing.
+  // LinkedIn sometimes links one person under two addresses (a vanity name and an
+  // ID), so also treat the same name + headline (or name + photo) as the same person.
+  function personKey(c) {
+    const name = c.name.toLowerCase();
+    if (c.headline && c.headline !== '--') return name + '|' + c.headline.toLowerCase();
+    return c.photo ? name + '|' + c.photo.split('?')[0] : null;
+  }
+
+  // Elements between el and the page that scroll on their own. LinkedIn's newer
+  // layout scrolls the list inside a box, so scrolling the window loads nothing.
+  function scrollContainers(el) {
+    const out = [];
+    for (let p = el?.parentElement; p; p = p.parentElement) {
+      const oy = getComputedStyle(p).overflowY;
+      if (/(auto|scroll|overlay)/.test(oy) && p.scrollHeight > p.clientHeight + 10) out.push(p);
+    }
+    return out;
+  }
+
+  function scrollToEnd() {
+    const anchors = profileAnchors();
+    const last = anchors[anchors.length - 1];
+    if (last) {
+      last.scrollIntoView({ block: 'end' });
+      for (const box of scrollContainers(last)) box.scrollTop = box.scrollHeight;
+    }
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  }
+
+  // Scrolls / clicks "Show more results" until the list stops growing.
   async function loadAllConnections(onProgress, shouldStop) {
     const all = new Map();
+    const seenPeople = new Set();
     let stableRounds = 0;
-    while (stableRounds < 4 && !shouldStop()) {
+    while (stableRounds < 6 && !shouldStop()) {
       const before = all.size;
       for (const [k, v] of scanVisibleConnections()) {
-        all.set(k, { ...v, photo: v.photo || all.get(k)?.photo || '' });
+        if (all.has(k)) {
+          all.set(k, { ...v, photo: v.photo || all.get(k).photo || '' });
+          continue;
+        }
+        const key = personKey(v);
+        if (key && seenPeople.has(key)) continue; // same person under another address
+        if (key) seenPeople.add(key);
+        all.set(k, v);
       }
       onProgress(all.size);
 
       const more = findClickableByText(LOAD_MORE_RE, document.querySelector('main') || document);
       if (more) realClick(more);
-      window.scrollTo(0, document.body.scrollHeight);
-      await sleep(1500);
+      scrollToEnd();
+      await sleep(more ? 2000 : 1500);
 
       stableRounds = all.size === before ? stableRounds + 1 : 0;
     }
@@ -283,6 +321,8 @@
     keep: {}, // slug -> name
     settings: { ...SETTINGS_DEFAULTS },
     filter: '',
+    tab: 'todo', // which list is showing: todo | kept | removed
+    queue: [], // slugs the big view steps through, fixed when it opens
     busy: false,
     stop: false,
     viewing: null, // slug shown in the big photo view
@@ -318,9 +358,13 @@
 
     .toolbar { display:flex;flex-direction:column;gap:10px;padding:12px 16px;border-bottom:1px solid #e8e8e8; }
     .toolbar input { width:100%;padding:12px 16px;border:1px solid #bbb;border-radius:24px;font-size:16px; }
-    .toolbar .row2 { display:flex;align-items:center;justify-content:space-between;gap:10px; }
-    .count { color:#555;font-size:14px; }
-    .review { border:2px solid #0a66c2;background:#fff;color:#0a66c2;border-radius:20px;padding:8px 14px;font-weight:700;font-size:14px; }
+    .tabs { display:flex;gap:6px;background:#eef3f8;border-radius:22px;padding:4px; }
+    .tabs button { flex:1;border:0;background:none;border-radius:18px;padding:9px 4px;font-size:14px;font-weight:600;color:#555; }
+    .tabs button b { display:inline-block;min-width:22px;margin-left:2px;padding:1px 6px;border-radius:10px;background:#dfe6ee;font-size:12px; }
+    .tabs button.on { background:#fff;color:#0a66c2;box-shadow:0 1px 3px rgba(0,0,0,.15); }
+    .tabs button.on b { background:#0a66c2;color:#fff; }
+    .review { border:2px solid #0a66c2;background:#fff;color:#0a66c2;border-radius:22px;padding:10px 14px;font-weight:700;font-size:15px; }
+    .empty { text-align:center;color:#666;padding:30px 10px;font-size:16px; }
 
     .list { flex:1;overflow:auto;padding:12px 16px;display:flex;flex-direction:column;gap:12px;background:#f4f2ee; }
     .card { background:#fff;border:2px solid #e0dfdc;border-radius:14px;padding:14px;display:grid;grid-template-columns:96px 1fr;gap:12px 14px;align-items:center; }
@@ -391,10 +435,12 @@
 
         <div class="toolbar" hidden>
           <input type="search" placeholder="🔍  Search by name or job">
-          <div class="row2">
-            <span class="count"></span>
-            <button class="review">👀 Review one by one</button>
+          <div class="tabs">
+            <button data-tab="todo">To review <b></b></button>
+            <button data-tab="kept">Kept <b></b></button>
+            <button data-tab="removed">Removed <b></b></button>
           </div>
+          <button class="review">👀 Review one by one</button>
         </div>
         <div class="list" hidden></div>
 
@@ -435,7 +481,8 @@
     const $ = (s) => shadow.querySelector(s);
     ui = {
       fab: $('.fab'), panel: $('.panel'), close: $('.close'), start: $('.start'), scan: $('.scan'),
-      toolbar: $('.toolbar'), search: $('input[type=search]'), count: $('.count'), review: $('.review'),
+      toolbar: $('.toolbar'), search: $('input[type=search]'), tabs: [...shadow.querySelectorAll('.tabs button')],
+      review: $('.review'),
       list: $('.list'), status: $('.status'), footer: $('footer'), removeAll: $('.remove-all'),
       stop: $('.stop'), rescan: $('.rescan'), dryRun: $('.dryRun'),
       minDelay: $('.minDelay'), maxDelay: $('.maxDelay'), maxPerRun: $('.maxPerRun'),
@@ -451,9 +498,12 @@
     ui.stop.onclick = requestStop;
     ui.search.oninput = () => { state.filter = ui.search.value.toLowerCase(); renderList(); };
     ui.removeAll.onclick = onRemoveAll;
+    for (const t of ui.tabs) t.onclick = () => { state.tab = t.dataset.tab; renderList(); };
     ui.review.onclick = () => {
-      const first = filtered().find((c) => !state.keep[c.slug] && c.status !== 'done') || filtered()[0];
-      if (first) openViewer(first.slug);
+      const rows = filtered();
+      const first = rows.find((c) => !decided(c)) || rows[0];
+      if (first) openViewer(first.slug, rows.map((c) => c.slug));
+      else setStatus('Nobody here to review.');
     };
 
     ui.back.onclick = closeViewer;
@@ -479,10 +529,17 @@
 
   const byslug = (slug) => state.connections.find((c) => c.slug === slug);
 
+  const decided = (c) => !!state.keep[c.slug] || c.status === 'done';
+
+  function inTab(c, tab = state.tab) {
+    if (tab === 'kept') return !!state.keep[c.slug];
+    if (tab === 'removed') return c.status === 'done';
+    return !decided(c);
+  }
+
   function filtered() {
-    if (!state.filter) return state.connections;
-    return state.connections.filter((c) =>
-      (c.name + ' ' + c.headline).toLowerCase().includes(state.filter));
+    return state.connections.filter((c) => inTab(c) &&
+      (!state.filter || (c.name + ' ' + c.headline).toLowerCase().includes(state.filter)));
   }
 
   function removable() {
@@ -543,7 +600,7 @@
     photoBtn.className = 'photo-btn';
     photoBtn.title = 'See bigger photo';
     photoBtn.append(photoEl(c));
-    photoBtn.onclick = () => openViewer(c.slug);
+    photoBtn.onclick = () => openViewer(c.slug, filtered().map((r) => r.slug));
 
     const info = document.createElement('div');
     info.className = 'info';
@@ -599,27 +656,33 @@
     for (const c of rows) ui.list.append(cardEl(c));
     if (!rows.length) {
       const empty = document.createElement('div');
-      empty.className = 'meta';
-      empty.style.textAlign = 'center';
-      empty.textContent = 'Nobody matches that search.';
+      empty.className = 'empty';
+      empty.textContent = state.filter ? 'Nobody matches that search.'
+        : { todo: "🎉 You've gone through everyone!", kept: "You haven't kept anyone yet.", removed: 'Nobody removed yet.' }[state.tab];
       ui.list.append(empty);
     }
+    for (const t of ui.tabs) t.classList.toggle('on', t.dataset.tab === state.tab);
     updateCounts();
   }
 
   // Re-draws one person's card (and the big view, if open) without rebuilding the whole list.
+  // A person who no longer belongs in the open tab (e.g. just kept) leaves the list.
   function refresh(c) {
     const old = ui.list.querySelector(`.card[data-slug="${CSS.escape(c.slug)}"]`);
-    if (old) old.replaceWith(cardEl(c));
+    if (old) {
+      if (inTab(c)) old.replaceWith(cardEl(c));
+      else old.remove();
+    }
+    if (!ui.list.querySelector('.card')) renderList();
     if (state.viewing === c.slug) renderViewer();
     updateCounts();
   }
 
   function updateCounts() {
-    const total = state.connections.length;
-    const kept = state.connections.filter((c) => state.keep[c.slug]).length;
     const n = removable().length;
-    ui.count.textContent = `${total} connections · ${kept} kept`;
+    for (const t of ui.tabs) {
+      t.querySelector('b').textContent = state.connections.filter((c) => inTab(c, t.dataset.tab)).length;
+    }
     ui.removeAll.textContent = n ? `Remove everyone not kept (${n})` : 'Nobody left to remove';
     ui.removeAll.disabled = n === 0 || state.busy;
   }
@@ -633,7 +696,8 @@
 
   // ----- big photo view -----
 
-  function openViewer(slug) {
+  function openViewer(slug, queue) {
+    if (queue) state.queue = queue;
     state.viewing = slug;
     ui.viewer.hidden = false;
     renderViewer();
@@ -644,22 +708,20 @@
     ui.viewer.hidden = true;
   }
 
-  // Arrows step through everyone; after a choice, skip to the next undecided person.
+  // Steps through the list as it was when the big view opened, so nobody shows up
+  // twice. After a choice, skip anyone already kept or removed.
   function stepViewer(dir, undecidedOnly = false) {
-    const rows = filtered();
-    const i = rows.findIndex((c) => c.slug === state.viewing);
-    let j = i + dir;
-    while (undecidedOnly && rows[j] && (state.keep[rows[j].slug] || rows[j].status === 'done')) j += dir;
-    const next = rows[j];
-    if (next) openViewer(next.slug);
+    const q = state.queue;
+    let j = q.indexOf(state.viewing) + dir;
+    while (q[j] && (!byslug(q[j]) || (undecidedOnly && decided(byslug(q[j]))))) j += dir;
+    if (q[j]) openViewer(q[j]);
     else if (dir > 0) { closeViewer(); setStatus("That's everyone! Use the red button to remove everyone you didn't keep."); }
   }
 
   function renderViewer() {
     const c = byslug(state.viewing);
     if (!c) return closeViewer();
-    const rows = filtered();
-    const i = rows.findIndex((r) => r.slug === c.slug);
+    const i = state.queue.indexOf(c.slug);
     const kept = !!state.keep[c.slug];
 
     ui.bigPhoto.textContent = '';
@@ -679,7 +741,7 @@
     ui.vRemove.textContent = '✕ Remove';
     if (done) ui.vMeta.textContent = 'Removed';
 
-    ui.pos.textContent = i >= 0 ? `${i + 1} of ${rows.length}` : '';
+    ui.pos.textContent = i >= 0 ? `${i + 1} of ${state.queue.length}` : '';
     ui.prev.disabled = i <= 0;
   }
 
@@ -702,7 +764,7 @@
     setStatus('Finding your connections. The page will scroll by itself.');
     try {
       const all = await loadAllConnections(
-        (n) => { ui.scan.textContent = `Found ${n}… (tap to stop)`; ui.count.textContent = `${n} found…`; },
+        (n) => { ui.scan.textContent = `Found ${n}… (tap to stop)`; },
         () => state.stop
       );
       state.connections = [...all.values()];

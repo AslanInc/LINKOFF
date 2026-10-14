@@ -23,6 +23,8 @@ It also works in Edge, Brave, and other Chromium browsers.
    - **✕ Remove**: removes just this person. Tap it twice (the first tap asks you to confirm), so a slip can't remove anyone.
 5. When you're done, click the red **Remove everyone not kept** button at the bottom.
 
+The tabs at the top sort people into **To review**, **Kept**, and **Removed**. When you keep or remove someone, they leave your To review list, so nobody shows up twice. Changed your mind? Open the **Kept** tab and tap **✓ Kept** to move them back.
+
 **Can't tell who someone is?** Tap their photo to see it full size with their job title. Or click **👀 Review one by one** to go through people one at a time. Tap Keep or Remove and it moves to the next person on its own.
 
 Click **■ Stop** at any time to halt.
